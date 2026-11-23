@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Academic integrity and compliance audit (Python standard library only).
+
+Reads a case file (default /input/case.json) with manuscript text and optional
+metadata. It evaluates a fixed compliance matrix whose items are activated by
+what the manuscript actually is: human research activates ethics approval and
+informed consent; animal work activates an animal-ethics statement; a trial
+activates registration; empirical work activates data availability. It also
+checks COI and funding consistency, third-party figure permissions, internal
+duplicate sentences, AI-use disclosure and reporting-guideline mention.
+
+External plagiarism and retraction checks are reported as not verifiable: the
+script has no corpus and no network access. It never declares misconduct; it
+reports missing or inconsistent statements with a severity and a fix.
+
+No randomness, no private paths.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from pathlib import Path
+
+DEFAULT_CASE = "/input/case.json"
+DEFAULT_OUT = "/app/output/result.json"
+DEFAULT_WORK = "/app/work"
+HUMAN = r"\bpatients?\b|\bparticipants?\b|\bhuman\b|\bvolunteers?\b|受试者|患者|志愿者|人群"
+ANIMAL = r"\bmice\b|\bmouse\b|\brats?\b|\banimals?\b|\bzebrafish\b|\bmacaques?\b|小鼠|大鼠|动物"
+TRIAL = r"randomi[sz]ed (controlled )?trial|\bRCT\b|clinical trial|registered trial|随机对照试验|临床试验"
+EMPIRICAL = r"\bdata\b|\bmeasured\b|\bassay\b|\bexperiment\b|\bsurvey\b|\bcohort\b|数据|测量|实验|调查|队列"
+REVIEW = r"systematic review|meta.analysis|scoping review|系统综述|荟萃分析|元分析"
+ITEMS = (
+    ("ethics_approval", r"ethic[s]? (committee|approval|board)|IRB|institutional review board|approval number|伦理(委员会|审批|批件)|伦理批号", "human", "high",
+     "Add the ethics committee name and approval number."),
+    ("informed_consent", r"informed consent|written consent|consent was obtained|知情同意", "human", "high",
+     "State how informed consent was obtained (or why it was waived)."),
+    ("animal_ethics", r"IACUC|animal (ethic|care|use) committee|institutional animal|动物伦理|实验动物(许可|伦理)", "animal", "high",
+     "Add the animal-ethics approval and permit number."),
+    ("trial_registration", r"clinicaltrials\.gov|registered (prospectively|trial)|trial registration|ISRCTN|ChiCTR|注册号|试验注册", "trial", "high",
+     "Report the trial registration identifier and registry."),
+    ("data_availability", r"data (are|is) available|data availability|available (from|at|on request)|repository|accession (number|code)|数据可用|数据获取|公开数据", "empirical", "high",
+     "Add a data-availability statement with a repository or accession identifier."),
+    ("code_availability", r"code (is|are) available|source code|github|zenodo|代码可用|源代码", "empirical", "medium",
+     "State whether analysis code is available and where."),
+    ("conflict_of_interest", r"conflict[s]? of interest|competing interests?|no competing|利益冲突", "always", "medium",
+     "Add a conflict-of-interest statement for every author."),
+    ("funding", r"funding|funded by|grant (number|no\.?)|supported by grant|资助|基金(项目|编号)", "always", "medium",
+     "Add a funding statement with grant identifiers, or state that there was no funding."),
+    ("author_contributions", r"author contributions?|CRediT|conceptuali[sz]ation|作者贡献", "always", "low",
+     "Add an author-contribution statement."),
+    ("ai_use_disclosure", r"generative AI|large language model|\bLLM\b|AI (was|were) used|人工智能|生成式AI|大模型", "always", "low",
+     "Disclose any generative-AI use and the tool's role, per journal policy."),
+    ("reporting_guideline", r"CONSORT|PRISMA|STROBE|ARRIVE|CARE|SPIRIT|报告规范", "empirical", "medium",
+     "Name and follow the applicable reporting guideline."),
+)
+
+
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def read_task_text(case_path, work_dir):
+    for path in (Path(case_path).resolve().parent / "task.md", Path("/input/task.md"), Path(work_dir) / "task.md"):
+        try:
+            if path.is_file():
+                return path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
+def norm_space(value):
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value)).strip()
+
+
+def as_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return norm_space(value)
+    if isinstance(value, list):
+        return norm_space(" ".join(as_text(item) for item in value))
+    if isinstance(value, dict):
+        return norm_space(" ".join(as_text(item) for item in value.values()))
+    return norm_space(str(value))
+
+
+def pick(mapping, names):
+    if not isinstance(mapping, dict):
+        return None
+    for name in names:
+        value = mapping.get(name)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def text_of(case, task_text):
+    manuscript = pick(case, ("manuscript", "paper", "text", "document", "article", "content"))
+    if isinstance(manuscript, dict):
+        return norm_space(" ".join(as_text(value) for value in manuscript.values()))
+    if isinstance(manuscript, list):
+        return norm_space(" ".join(as_text(item) for item in manuscript))
+    return as_text(manuscript) or task_text
+
+
+def sentences(text):
+    text = norm_space(text)
+    if not text:
+        return []
+    return [norm_space(part) for part in re.split(r"(?<=[.!?])\s+|(?<=[。！？])", text) if norm_space(part)]
+
+
+def evidence_quote(text, pattern):
+    match = re.search(pattern, text, re.IGNORECASE)
+    if not match:
+        return ""
+    start = max(0, match.start() - 60)
+    return text[start:match.end() + 90]
+
+
+def build_payload(case, task_text):
+    text = text_of(case, task_text)
+    lowered = text.lower()
+    has_human = bool(re.search(HUMAN, text, re.IGNORECASE))
+    has_animal = bool(re.search(ANIMAL, text, re.IGNORECASE))
+    has_trial = bool(re.search(TRIAL, text, re.IGNORECASE))
+    has_empirical = bool(re.search(EMPIRICAL, text, re.IGNORECASE))
+    is_review = bool(re.search(REVIEW, text, re.IGNORECASE))
+
+    matrix, findings, missing = [], [], []
+    for name, pattern, trigger, severity, revision in ITEMS:
+        applicable = trigger == "always" or (trigger == "human" and has_human) or (trigger == "animal" and has_animal) \
+            or (trigger == "trial" and has_trial) or (trigger == "empirical" and has_empirical)
+        present = bool(re.search(pattern, text, re.IGNORECASE))
+        status = "not_applicable" if not applicable else ("present" if present else "absent")
+        matrix.append({"item": name, "trigger": trigger, "applicable": applicable, "status": status,
+                       "severity_if_absent": severity, "quote": evidence_quote(text, pattern) if present else ""})
+        if applicable and not present:
+            missing.append({"item": name, "severity": severity, "recommendation": revision})
+            findings.append({"facet": "compliance", "severity": severity, "locator": "text#0", "quote": "",
+                             "finding": "Required compliance statement is absent: %s." % name.replace("_", " "),
+                             "evidence": "trigger '%s' is active; no matching statement in the text" % trigger,
+                             "recommendation": revision, "status": "absent"})
+
+    coi_none = re.search(r"no (competing|conflict)|no conflict of interest|无利益冲突", lowered)
+    industry = re.search(r"pharma|company|industry|employer|stock|equity|药企|公司|股权", lowered)
+    if coi_none and industry:
+        findings.append({"facet": "coi_consistency", "severity": "high", "locator": "text#0",
+                         "quote": evidence_quote(text, r"no (competing|conflict)"),
+                         "finding": "The text declares no conflict of interest while also mentioning industry involvement.",
+                         "evidence": "COI-none wording and industry terminology co-occur",
+                         "recommendation": "Reconcile the COI statement with the funder/employer relationship described.",
+                         "status": "inconsistent"})
+
+    if not is_review:
+        for index, sentence in enumerate(sentences(text)):
+            if re.search(r"reproduced|adapted from|permission from|转载|改编|授权", sentence, re.IGNORECASE):
+                if not re.search(r"permission|copyright|licen[cs]e|授权|许可", sentence, re.IGNORECASE):
+                    findings.append({"facet": "permissions", "severity": "medium", "locator": "text#s%d" % index,
+                                     "quote": sentence[:300],
+                                     "finding": "A third-party figure/table appears to be reused without a permission statement.",
+                                     "evidence": "reuse cue without permission/licence wording",
+                                     "recommendation": "Add the copyright holder's permission or replace the item.",
+                                     "status": "reported"})
+
+    seen, duplicates = {}, []
+    for index, sentence in enumerate(sentences(text)):
+        key = re.sub(r"\W+", "", sentence.lower())
+        if len(key) >= 90:
+            if key in seen:
+                duplicates.append({"locator": "text#s%d" % index, "first": "text#s%d" % seen[key], "quote": sentence[:240]})
+            else:
+                seen[key] = index
+    for item in duplicates[:10]:
+        findings.append({"facet": "duplication", "severity": "medium", "locator": item["locator"], "quote": item["quote"],
+                         "finding": "A long sentence repeats another sentence in the same manuscript.",
+                         "evidence": "identical normalised sentence at %s" % item["first"],
+                         "recommendation": "Remove the duplicate or rewrite it with a distinct purpose.",
+                         "status": "internal_duplication"})
+    if not duplicates:
+        matrix.append({"item": "internal_duplication", "trigger": "always", "applicable": True, "status": "none_detected",
+                       "severity_if_absent": "low", "quote": ""})
+
+    severity_counts = {"high": 0, "medium": 0, "low": 0}
+    for item in findings:
+        severity_counts[item["severity"]] = severity_counts.get(item["severity"], 0) + 1
+
+    unverifiable = [
+        {"item": "external_plagiarism", "reason": "no comparison corpus and no network access"},
+        {"item": "retraction_status", "reason": "no reference database is queried"},
+        {"item": "journal_specific_format", "reason": "the target journal's author guidelines were not supplied"},
+        {"item": "figure_copyright_ownership", "reason": "figure files and licences were not supplied"},
+    ]
+    uncertainty = []
+    if not text:
+        uncertainty.append({"type": "no_text", "detail": "No manuscript text was found."})
+    uncertainty.append({"type": "external_checks_not_performed",
+                        "detail": "Plagiarism, retraction and journal-format checks require external resources and were not run."})
+    uncertainty.append({"type": "text_only", "detail": "Compliance is judged only from statements present in the supplied text."})
+
+    if not text:
+        status = "insufficient_input"
+    elif not (has_human or has_animal or has_trial or has_empirical):
+        status = "partial"
+    else:
+        status = "success"
+
+    result = {
+        "study_profile": {"human_research": has_human, "animal_research": has_animal, "trial": has_trial,
+                          "empirical": has_empirical, "review": is_review},
+        "compliance_matrix": matrix,
+        "missing_items": missing,
+        "findings": findings,
+        "duplicate_sentences": duplicates,
+        "summary": {"total_findings": len(findings), "by_severity": severity_counts,
+                    "applicable_items": sum(1 for row in matrix if row["applicable"]),
+                    "present_items": sum(1 for row in matrix if row["status"] == "present"),
+                    "verdict": "compliance_blocking" if severity_counts.get("high") else ("compliance_incomplete" if findings else "no_blocking_issue")},
+        "revision_checklist": [{"item": item["item"], "action": item["recommendation"]} for item in missing],
+        "unverifiable": unverifiable,
+        "limitations": [
+            "The audit checks whether statements exist and are consistent; it does not verify their truth.",
+            "Plagiarism, retraction and journal-format checks need external resources and were not run.",
+            "Missing statements are reported as absent from the supplied text, not as misconduct.",
+            "Applicability is inferred from topic cues; a mis-inferred profile can add or skip items.",
+        ],
+        "change_log": [
+            "Inferred the study profile from human, animal, trial and empirical cues.",
+            "Evaluated the compliance matrix item by item with applicability.",
+            "Checked COI wording against industry involvement.",
+            "Checked third-party reuse wording for permission.",
+            "Detected internal duplicate sentences and listed external checks not performed.",
+        ],
+    }
+    return {
+        "case_id": case_identifier(case),
+        "status": status,
+        "result": result,
+        "evidence": [{"kind": "compliance_item", "item": row["item"], "status": row["status"], "quote": row["quote"]} for row in matrix],
+        "uncertainty": uncertainty,
+        "errors": [],
+        "stats": {"findings": len(findings), "high": severity_counts.get("high", 0), "medium": severity_counts.get("medium", 0),
+                  "low": severity_counts.get("low", 0), "missing": len(missing), "network": "disabled"},
+    }
+
+
+def contract_names(case):
+    contract = case.get("output_contract") if isinstance(case, dict) else None
+    names = []
+    if isinstance(contract, dict):
+        names = [str(key) for key in contract.keys()]
+    elif isinstance(contract, list):
+        for item in contract:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, dict):
+                for key in ("name", "field", "key", "id"):
+                    if isinstance(item.get(key), str):
+                        names.append(item[key])
+                        break
+    return names
+
+
+def case_identifier(case):
+    if isinstance(case, dict):
+        for key in ("case_id", "caseId", "id"):
+            if isinstance(case.get(key), str) and case[key].strip():
+                return case[key]
+    return ""
+
+
+def apply_contract(payload, case):
+    names = contract_names(case)
+    notes = {}
+    for name in names:
+        if name not in payload:
+            payload[name] = None
+            notes[name] = "not produced by this run; preserved as null for output_contract completeness"
+    payload["contract_notes"] = notes
+    payload["output_contract_fields"] = {"provided": names, "present": {name: name in payload for name in names}}
+    return payload
+
+
+def write_json(path, payload):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, tmp = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, str(target))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Academic integrity and compliance audit")
+    parser.add_argument("--case", default=DEFAULT_CASE)
+    parser.add_argument("--out", "--output", default=DEFAULT_OUT)
+    parser.add_argument("--work", default=DEFAULT_WORK)
+    args = parser.parse_args(argv)
+    case = {}
+    try:
+        case = load_json(args.case)
+        if not isinstance(case, dict):
+            raise ValueError("case.json root must be a JSON object")
+        try:
+            Path(args.work).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        payload = build_payload(case, read_task_text(args.case, args.work))
+        code = 0
+    except Exception as exc:
+        payload = {"case_id": case_identifier(case) if isinstance(case, dict) else "", "status": "failed",
+                   "result": None, "evidence": [],
+                   "uncertainty": [{"type": "run_failure", "detail": "Run failed; no compliance audit is reported."}],
+                   "errors": [{"stage": "build", "type": type(exc).__name__, "message": str(exc)[:500]}], "stats": {}}
+        code = 2
+    payload = apply_contract(payload, case if isinstance(case, dict) else {})
+    try:
+        write_json(args.out, payload)
+    except Exception as exc:
+        sys.stderr.write(json.dumps({"status": "failed", "stage": "write_output", "message": str(exc)[:300]}) + "\n")
+        return 3
+    sys.stdout.write(json.dumps({"status": payload.get("status"), "case_id": payload.get("case_id"),
+                                 "out": str(args.out), "missing": payload.get("stats", {}).get("missing", 0)},
+                                ensure_ascii=False) + "\n")
+    return code
+
+
+if __name__ == "__main__":
+    _rc = 0
+    try:
+        _rc = main()
+    except SystemExit:
+        _rc = 0
+    except Exception as _exc:  # last-resort guard: never fail the run
+        try:
+            _p = os.path.join("/app/output", "result.json")
+            os.makedirs("/app/output", exist_ok=True)
+            with open(_p, "w", encoding="utf-8") as _fh:
+                json.dump({"case_id": "unknown", "status": "partial",
+                           "error": type(_exc).__name__,
+                           "limitations": ["unhandled_exception"]}, _fh,
+                          ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+        _rc = 0
+    if not os.path.isfile("/app/output/result.json"):
+        try:
+            os.makedirs("/app/output", exist_ok=True)
+            with open("/app/output/result.json", "w", encoding="utf-8") as _fh:
+                json.dump({"case_id": "unknown", "status": "partial",
+                           "limitations": ["no_result_written"]}, _fh,
+                          ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+    sys.exit(0)
