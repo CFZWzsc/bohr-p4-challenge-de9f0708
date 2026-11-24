@@ -13,6 +13,20 @@ description: Use when a manuscript must be checked for academic-integrity and co
 
 **不适用**：查重、撤稿查询、期刊格式逐条比对、判断学术不端、替代机构伦理审查。
 
+## Quickstart
+
+包内自带一个合成演示案例，可直接跑通：
+
+```powershell
+python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP\demo_de9f0708\result.json" --work "$env:TEMP\demo_de9f0708\work"
+```
+
+- 演示输入：`examples/demo-case/case.json`，8 段合成稿件（含伦理批准与知情同意，但缺代码可用性声明与明确的资助语句，且引用了他人图片未写许可）。
+- 输出：`$env:TEMP\demo_de9f0708\result.json`，`status=success`，5 条 findings（1 high / 4 medium），`verdict.decision=major_revision`，`missing` 计数为 2。
+- `output_contract` 的 `issues`、`summary`、`verdict` 三个键均非空；同一输入连续两次运行的 result.json 字节一致。
+
+> 案例文本为合成内容，不代表任何真实论文或官方评测数据。
+
 ## 输入
 
 | 输入 | 说明 |
