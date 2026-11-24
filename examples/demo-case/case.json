@@ -1,0 +1,18 @@
+{
+  "case_id": "demo-compliance-01",
+  "output_contract": {
+    "issues": "array",
+    "summary": "object",
+    "verdict": "string"
+  },
+  "manuscript": [
+    "Title: Structured exercise for chronic fatigue in adults: a single-centre cohort study.",
+    "We enrolled 40 patients with chronic fatigue at one teaching hospital. The study was approved by the ethics committee (approval number ERC-2026-014). Written informed consent was obtained from every participant.",
+    "Symptom scores were measured at baseline and at 12 months, and the change was compared between participants who completed the programme and those who did not.",
+    "The sponsor is Example Pharma Ltd, which provided the exercise equipment. The authors declare no conflict of interest.",
+    "Figure 2 is adapted from Smith et al. 2024.",
+    "Data are available at https://example.org/datasets/fatigue-cohort. The analysis followed the STROBE reporting guideline. Author contributions: A. B. conceived the study and C. D. analysed the data. No generative AI was used in the preparation of this manuscript.",
+    "Participants who completed the programme reported lower symptom scores at 12 months than participants who did not complete the programme.",
+    "Participants who completed the programme reported lower symptom scores at 12 months than participants who did not complete the programme."
+  ]
+}
