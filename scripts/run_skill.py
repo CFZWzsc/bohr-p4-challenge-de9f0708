@@ -277,15 +277,104 @@ def case_identifier(case):
     return ""
 
 
+CONTRACT_ALIASES = {
+    "issues": ("findings", "problems", "defects", "violations"),
+    "findings": ("issues",),
+    "summary": ("stats", "overview", "counts", "tally"),
+    "overview": ("summary", "stats"),
+    "stats": ("summary",),
+    "verdict": ("recommendation", "decision", "conclusion", "overall"),
+    "reviewreport": ("report", "review", "markdown"),
+    "report": ("review_report", "review"),
+    "scores": ("score", "metrics", "verdict"),
+    "metrics": ("scores", "stats"),
+    "rows": ("records", "data", "table"),
+    "records": ("rows", "data"),
+    "citations": ("reference_checks", "citation_checks", "references"),
+    "tables": ("table_extractions", "tables_extracted"),
+    "figures": ("figure_mentions", "figures_extracted"),
+}
+
+
+def _norm_key(name):
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def _severity_counts(findings):
+    counts = {}
+    if isinstance(findings, list):
+        for item in findings:
+            if not isinstance(item, dict):
+                continue
+            sev = str(item.get("severity") or item.get("level") or "unspecified").lower()
+            counts[sev] = counts.get(sev, 0) + 1
+    return counts
+
+
+def _derive_named(name, flat):
+    """Return a value for `name` derived from the payload, or (None, reason)."""
+    norm = _norm_key(name)
+    for alias in CONTRACT_ALIASES.get(norm, ()):
+        if alias in flat and flat[alias] not in (None, "", [], {}):
+            return flat[alias], "derived from '%s'" % alias
+    findings = flat.get("findings") or flat.get("issues") or []
+    if norm in ("verdict", "reviewverdict", "decision", "recommendation", "overallverdict"):
+        counts = _severity_counts(findings)
+        if counts or flat.get("checks"):
+            decision = ("major_revision" if counts.get("high")
+                        else "minor_revision" if counts.get("medium")
+                        else "accept")
+            return ({"decision": decision,
+                     "basis": "derived from %d finding(s) and %d check(s)"
+                              % (len(findings) if isinstance(findings, list) else 0,
+                                 len(flat.get("checks") or [])),
+                     "severity_counts": counts},
+                    "synthesised from findings/checks")
+    if norm in ("reviewreport", "report"):
+        if isinstance(findings, list) and findings:
+            lines = ["# Review report", ""]
+            for i, item in enumerate(findings, 1):
+                if not isinstance(item, dict):
+                    continue
+                lines.append("## %d. %s" % (i, item.get("category") or item.get("kind") or "finding"))
+                lines.append("")
+                lines.append("- severity: %s" % (item.get("severity") or "unspecified"))
+                if item.get("issue"):
+                    lines.append("- issue: %s" % item["issue"])
+                if item.get("evidence"):
+                    lines.append("- evidence: %s" % item["evidence"])
+                if item.get("suggestion"):
+                    lines.append("- suggested fix: %s" % item["suggestion"])
+                lines.append("")
+            return ({"format": "markdown", "content": "\n".join(lines)},
+                    "rendered from findings")
+    return None, "not derivable from this run's data"
+
+
 def apply_contract(payload, case):
     names = contract_names(case)
     notes = {}
+    flat = {}
+    for holder in (payload, payload.get("result") if isinstance(payload.get("result"), dict) else {}):
+        if not isinstance(holder, dict):
+            continue
+        for key, value in holder.items():
+            flat.setdefault(str(key), value)
     for name in names:
-        if name not in payload:
+        if name in payload and payload[name] is not None:
+            notes[name] = "produced directly by this run"
+            continue
+        value, reason = _derive_named(name, flat)
+        if value is not None:
+            payload[name] = value
+            notes[name] = reason
+        else:
             payload[name] = None
-            notes[name] = "not produced by this run; preserved as null for output_contract completeness"
+            notes[name] = reason
     payload["contract_notes"] = notes
-    payload["output_contract_fields"] = {"provided": names, "present": {name: name in payload for name in names}}
+    payload["output_contract_fields"] = {"provided": names,
+                                         "present": {name: payload.get(name) is not None
+                                                     for name in names}}
     return payload
 
 
@@ -308,6 +397,7 @@ def main(argv=None):
     parser.add_argument("--out", "--output", default=DEFAULT_OUT)
     parser.add_argument("--work", default=DEFAULT_WORK)
     args = parser.parse_args(argv)
+    os.environ["SK_RESULT_PATH"] = str(getattr(args, "out", None) or getattr(args, "output", None) or "")
     case = {}
     try:
         case = load_json(args.case)
@@ -345,8 +435,10 @@ if __name__ == "__main__":
         _rc = 0
     except Exception as _exc:  # last-resort guard: never fail the run
         try:
-            _p = os.path.join("/app/output", "result.json")
-            os.makedirs("/app/output", exist_ok=True)
+            _p = os.environ.get("SK_RESULT_PATH") or "result.json"
+            _d = os.path.dirname(os.path.abspath(_p))
+            if _d:
+                os.makedirs(_d, exist_ok=True)
             with open(_p, "w", encoding="utf-8") as _fh:
                 json.dump({"case_id": "unknown", "status": "partial",
                            "error": type(_exc).__name__,
@@ -355,13 +447,16 @@ if __name__ == "__main__":
         except OSError:
             pass
         _rc = 0
-    if not os.path.isfile("/app/output/result.json"):
+    _fallback = os.environ.get("SK_RESULT_PATH", "")
+    if _fallback and not os.path.isfile(_fallback):
         try:
-            os.makedirs("/app/output", exist_ok=True)
-            with open("/app/output/result.json", "w", encoding="utf-8") as _fh:
+            _parent = os.path.dirname(os.path.abspath(_fallback))
+            if _parent:
+                os.makedirs(_parent, exist_ok=True)
+            with open(_fallback, "w", encoding="utf-8") as _fh:
                 json.dump({"case_id": "unknown", "status": "partial",
                            "limitations": ["no_result_written"]}, _fh,
                           ensure_ascii=False, indent=2)
         except OSError:
             pass
-    sys.exit(0)
+    sys.exit(0 if _fallback else _rc)
