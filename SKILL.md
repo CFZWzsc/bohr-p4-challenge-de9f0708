@@ -96,3 +96,10 @@ python /skills/weekly-skill/scripts/run_skill.py --case /input/case.json --out /
 - 每个问题附定位、原文、判定、依据与修改建议；覆盖输入中的全部声明项，不静默跳过。
 - 输入缺失、JSON 损坏或输出不可写时，仍写出结构化 `result.json` 并正常退出；未检查项写入 `uncertainty` / `limitations`，不伪造内容。
 - 结果由输入驱动，保持确定性（同一输入双跑字节一致）；不联网、不声称平台评分。
+
+## 输入发现与伴随产物
+
+- 输入发现：除 `case.json` 字段外，运行时会扫描其所在目录的 `manuscript.md`、`paper.txt`、`*.json`、`*.jsonl`、`*.csv` 等真实文件并合并；按内容判断稿件/参考文献角色，文件名不作标签；发现清单写入 `provenance.json`。
+- 伴随产物（单次运行同时写出）：`review.json`、`checklist.csv`、`report.md`、`provenance.json`、`validation.json`。`output_contract` 字段若对应这些产物，`result.json` 直接给出文件名并在 `contract_notes` 说明。
+- `validation.json` 记录契约覆盖、计数对账与引文核验结果（`locator_status.n_locator_issues`）。
+- 证据复核：`result.verification` 给出 `quotes_checked` / `quotes_verified` / `verification_rate`，每条引文附 `paragraph_id` 与 `quote_verified`（逐字比对真实材料）；未定位项进入 `human_confirm`，不静默放行。
