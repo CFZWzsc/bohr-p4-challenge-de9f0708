@@ -467,6 +467,11 @@ def main(argv=None):
     case = {}
     try:
         case = load_json(args.case)
+        try:
+            import review_ext
+            case = review_ext.augment_case(case, args.case, sections=True)
+        except Exception:
+            pass
         if not isinstance(case, dict):
             raise ValueError("case.json root must be a JSON object")
         try:
@@ -474,6 +479,12 @@ def main(argv=None):
         except OSError:
             pass
         payload = build_payload(case, read_task_text(args.case, args.work))
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import review_core
+            payload = review_core.enrich(payload, case, args.out)
+        except Exception:
+            pass
         code = 0
     except Exception as exc:
         payload = {"case_id": case_identifier(case) if isinstance(case, dict) else "", "status": "failed",
@@ -483,10 +494,21 @@ def main(argv=None):
         code = 2
     payload = apply_contract(payload, case if isinstance(case, dict) else {})
     try:
+        import review_ext
+        payload = review_ext.enrich(payload, case if isinstance(case, dict) else {}, args.case, args.work)
+    except Exception:
+        pass
+    try:
         write_json(args.out, payload)
     except Exception as exc:
         sys.stderr.write(json.dumps({"status": "failed", "stage": "write_output", "message": str(exc)[:300]}) + "\n")
         return 3
+    try:
+        import review_ext
+        review_ext.write_artifacts(payload, args.out, case if isinstance(case, dict) else {},
+                                   args.case, args.work)
+    except Exception:
+        pass
     report = payload.get("review_report")
     if isinstance(report, dict) and report.get("content"):
         try:
