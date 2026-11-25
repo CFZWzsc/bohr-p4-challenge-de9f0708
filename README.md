@@ -16,7 +16,12 @@ answers, private data or credentials are included.
 | File |
 |------|
 | `SKILL.md` |
+| `docs/ERROR_HANDLING.md` |
 | `examples/demo-case/case.json` |
+| `examples/quickstart.md` |
+| `references/output-contract.md` |
+| `scripts/review_core.py` |
+| `scripts/review_ext.py` |
 | `scripts/run_skill.py` |
 | `README.md` |
 
