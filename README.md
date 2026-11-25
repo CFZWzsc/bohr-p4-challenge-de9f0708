@@ -20,6 +20,7 @@ answers, private data or credentials are included.
 | `examples/demo-case/case.json` |
 | `examples/quickstart.md` |
 | `references/output-contract.md` |
+| `references/peer-review-checklist.md` |
 | `scripts/review_core.py` |
 | `scripts/review_ext.py` |
 | `scripts/run_skill.py` |
