@@ -395,6 +395,7 @@ def enrich(payload, case, case_path=None, work_dir=None):
     }
     artifacts = [ARTIFACT_JSON, ARTIFACT_CSV, ARTIFACT_MD, ARTIFACT_PROV, ARTIFACT_VALID]
     payload["artifacts"] = artifacts
+    payload["recommendation"] = _recommendation(issues)
     fields = payload.get("output_contract_fields")
     if not isinstance(fields, dict):
         fields = {"provided": [], "present": {}}
@@ -447,30 +448,79 @@ def _csv_rows(issues):
     return rows
 
 
+def _recommendation(issues):
+    """Conservative reviewer recommendation derived only from finding severity."""
+    counts = {"high": 0, "medium": 0, "low": 0}
+    for item in issues:
+        if isinstance(item, dict):
+            sev = str(item.get("severity") or "").lower()
+            if sev in counts:
+                counts[sev] += 1
+    if counts["high"]:
+        decision = "major_revision"
+        rationale = "%d high-severity concern(s) affect the validity or support of the main claims" % counts["high"]
+    elif counts["medium"]:
+        decision = "minor_revision"
+        rationale = "no high-severity concern; %d medium-severity concern(s) need revision" % counts["medium"]
+    elif counts["low"]:
+        decision = "minor_revision"
+        rationale = "only %d low-severity/editorial concern(s) were detected" % counts["low"]
+    else:
+        decision = "no_blocking_issues"
+        rationale = "no blocking issue was detected by the checked facets"
+    return {"decision": decision, "rationale": rationale, "severity_counts": counts,
+            "scope": "derived from the reported findings only; not a substitute for editorial judgement"}
+
+
 def _report_markdown(payload, case_id):
     report = payload.get("review_report")
     if isinstance(report, dict) and report.get("content"):
-        return str(report["content"])
-    if isinstance(report, str) and report.strip():
-        return report
-    issues = _issue_list(payload)
-    counts = (payload.get("counts_reconciliation") or {}).get("by_severity") or {}
-    lines = ["# Review report", "", "- case_id: `%s`" % (case_id or "unknown"),
-             "- status: %s" % payload.get("status"),
-             "- findings: %d (high %d / medium %d / low %d)" % (
-                 len(issues), counts.get("high", 0), counts.get("medium", 0), counts.get("low", 0)), ""]
-    for index, item in enumerate(issues, 1):
-        if not isinstance(item, dict):
+        base = str(report["content"]).rstrip()
+    elif isinstance(report, str) and report.strip():
+        base = report.rstrip()
+    else:
+        base = "# Review report\n\n- case_id: `%s`\n- status: %s" % (
+            case_id or "unknown", payload.get("status"))
+    issues = [item for item in _issue_list(payload) if isinstance(item, dict)]
+    rec = payload.get("recommendation") or _recommendation(issues)
+    counts = rec.get("severity_counts") or {}
+    major = [i for i in issues if str(i.get("severity") or "").lower() in ("high", "medium")]
+    minor = [i for i in issues if str(i.get("severity") or "").lower() == "low"]
+    other = [i for i in issues if i not in major and i not in minor]
+    lines = [base, "", "## Summary", "",
+             "The review reports %d finding(s): %d high, %d medium, %d low. Decision: **%s** — %s." % (
+                 len(issues), counts.get("high", 0), counts.get("medium", 0), counts.get("low", 0),
+                 rec.get("decision"), rec.get("rationale")), ""]
+    for title, group in (("Major concerns", major), ("Minor concerns", minor), ("Other concerns", other)):
+        if not group:
             continue
-        lines.append("## F%d [%s] %s" % (index, item.get("severity") or "unspecified",
-                                         item.get("facet") or item.get("category") or "finding"))
+        lines += ["## %s" % title, ""]
+        for index, item in enumerate(group, 1):
+            lines.append("%d. **%s** (%s) — `%s`" % (
+                index, item.get("facet") or item.get("category") or "issue",
+                item.get("severity") or "unspecified",
+                item.get("locator") or item.get("location") or "n/a"))
+            if item.get("quote"):
+                lines.append("   - quote: \"%s\"" % item["quote"])
+            if item.get("issue") or item.get("finding"):
+                lines.append("   - issue: %s" % (item.get("issue") or item.get("finding")))
+            if item.get("recommendation") or item.get("suggested_revision"):
+                lines.append("   - revision: %s" % (item.get("recommendation") or item.get("suggested_revision")))
         lines.append("")
-        lines.append("- locator: `%s`" % (item.get("locator") or item.get("location") or "n/a"))
-        if item.get("quote"):
-            lines.append("- quote: \"%s\"" % item["quote"])
-        lines.append("- issue: %s" % (item.get("issue") or item.get("finding") or ""))
-        lines.append("- evidence: %s" % (item.get("evidence") or item.get("rationale") or ""))
-        lines.append("- recommendation: %s" % (item.get("recommendation") or item.get("suggested_revision") or ""))
+    lines += ["## Recommendation", "", "- decision: `%s`" % rec.get("decision"),
+              "- rationale: %s" % rec.get("rationale"),
+              "- scope: %s" % rec.get("scope"), ""]
+    checks = payload.get("checks")
+    if isinstance(checks, list) and checks:
+        lines += ["## Review checklist", "", "| check | status | detail |", "|---|---|---|"]
+        for item in checks:
+            if isinstance(item, dict):
+                lines.append("| %s | %s | %s |" % (
+                    str(item.get("check") or item.get("name") or "")[:90],
+                    item.get("status") or "",
+                    str(item.get("detail") or item.get("note") or "")[:120]))
+            else:
+                lines.append("| %s | | |" % str(item)[:90])
         lines.append("")
     return "\n".join(lines)
 
