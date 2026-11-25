@@ -102,4 +102,5 @@ python /skills/weekly-skill/scripts/run_skill.py --case /input/case.json --out /
 - 输入发现：除 `case.json` 字段外，运行时会扫描其所在目录的 `manuscript.md`、`paper.txt`、`*.json`、`*.jsonl`、`*.csv` 等真实文件并合并；按内容判断稿件/参考文献角色，文件名不作标签；发现清单写入 `provenance.json`。
 - 伴随产物（单次运行同时写出）：`review.json`、`checklist.csv`、`report.md`、`provenance.json`、`validation.json`。`output_contract` 字段若对应这些产物，`result.json` 直接给出文件名并在 `contract_notes` 说明。
 - `validation.json` 记录契约覆盖、计数对账与引文核验结果（`locator_status.n_locator_issues`）。
+- 问题分级与定位角色：每条 finding 附 `issue_type`（factual_error / citation_error / method_issue / statistical_issue / reasoning_gap / norms_issue / suggestion）、`quote_role`（quote / anchor / absent / citation_marker）与必要时的 `quote_context`；`anchor` 表示该结论属“缺失类”，所引句子是所在章节的最近锚句，不是缺陷本身的证据。
 - 证据复核：`result.verification` 给出 `quotes_checked` / `quotes_verified` / `verification_rate`，每条引文附 `paragraph_id` 与 `quote_verified`（逐字比对真实材料）；未定位项进入 `human_confirm`，不静默放行。
