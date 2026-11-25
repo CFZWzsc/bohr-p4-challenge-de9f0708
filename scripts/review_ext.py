@@ -340,16 +340,246 @@ def _issue_list(payload):
     return []
 
 
+SECTION_ALIASES = {
+    "abstract": ("abstract", "摘要"),
+    "introduction": ("introduction", "background", "引言", "前言"),
+    "methods": ("methods", "method", "materials and methods", "methodology", "方法", "材料与方法"),
+    "results": ("results", "findings", "结果"),
+    "discussion": ("discussion", "讨论"),
+    "conclusion": ("conclusion", "conclusions", "结论"),
+    "body": ("body", "full_text", "fulltext", "正文", "全文"),
+}
+TYPE_BY_FACET = {
+    "numeric_consistency": "factual_error",
+    "factual_consistency": "factual_error",
+    "citation_support": "citation_error",
+    "citation_integrity": "citation_error",
+    "source_reliability": "citation_error",
+    "methods_reporting": "method_issue",
+    "design": "method_issue",
+    "sampling": "method_issue",
+    "reproducibility": "method_issue",
+    "statistical_reporting": "statistical_issue",
+    "statistics": "statistical_issue",
+    "statistics_reporting": "statistical_issue",
+    "argument_chain": "reasoning_gap",
+    "inference": "reasoning_gap",
+    "academic_norms": "norms_issue",
+    "academic_norm": "norms_issue",
+}
+
+
+def _flatten_strings(value, depth=0):
+    """Collect every string in a JSON-ish structure (dict values, incl. nested)."""
+    out = []
+    if depth > 8:
+        return out
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, (int, float)):
+        out.append(str(value))
+    elif isinstance(value, list):
+        for item in value:
+            out.extend(_flatten_strings(item, depth + 1))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).startswith("_"):
+                continue
+            out.extend(_flatten_strings(item, depth + 1))
+    return out
+
+
 def _material_text(case):
-    chunks = [str(case.get("manuscript") or "")]
-    refs = case.get("references")
-    if isinstance(refs, list):
-        for ref in refs:
-            if isinstance(ref, dict):
-                chunks.append(" ".join(str(v) for v in ref.values()))
+    """All real input text, flattened — quotes are matched against this, never against str(dict)."""
+    if not isinstance(case, dict):
+        return ""
+    return _norm(" ".join(_flatten_strings(case)))
+
+
+def _first_sentence(text, limit=300):
+    text = _norm(text)
+    if not text:
+        return ""
+    for part in re.split(r"(?<=[.!?。！？])\s*", text):
+        part = _norm(part)
+        if len(part) >= 20:
+            return part[:limit]
+    return text[:limit]
+
+
+def _section_texts(case):
+    """Map lower-cased section names (and canonical aliases) to their raw text."""
+    if not isinstance(case, dict):
+        return {}
+    raw = {}
+    source = case.get("manuscript")
+    if source in (None, "", [], {}):
+        for key in ("paper", "text", "document", "article", "full_text"):
+            if case.get(key) not in (None, "", [], {}):
+                source = case.get(key)
+                break
+    if isinstance(source, dict):
+        inner = source.get("sections") if isinstance(source.get("sections"), dict) else source
+        for key, value in inner.items():
+            text = _norm(" ".join(_flatten_strings(value)))
+            if text:
+                raw[str(key).strip().lower()] = text
+    elif isinstance(source, str):
+        current, buffer = "body", []
+        for line in source.splitlines():
+            candidate = _norm(line.strip("# ")).lower().rstrip(":")
+            matched = None
+            for canonical, aliases in SECTION_ALIASES.items():
+                if candidate == canonical or candidate in aliases:
+                    matched = canonical
+                    break
+            if matched and len(candidate) <= 40:
+                if buffer:
+                    raw.setdefault(current, _norm(" ".join(buffer)))
+                current, buffer = matched, []
             else:
-                chunks.append(str(ref))
-    return _norm(" ".join(chunks))
+                buffer.append(line)
+        if buffer:
+            raw.setdefault(current, _norm(" ".join(buffer)))
+    out = {}
+    for key, text in raw.items():
+        out.setdefault(key, text)
+        for canonical, aliases in SECTION_ALIASES.items():
+            if key == canonical or key in aliases:
+                out.setdefault(canonical, text)
+    return out
+
+
+def _sentences(text):
+    text = _norm(text)
+    if not text:
+        return []
+    return [part.strip() for part in re.split(r"(?<=[.!?。！？])\s*", text) if len(part.strip()) >= 20]
+
+
+def _anchor_empty_quote(item, sections, used):
+    """Give absence-type findings an anchor sentence so the locator stays checkable."""
+    quote = _norm(item.get("quote") or "")
+    if quote:
+        return False
+    facet = str(item.get("facet") or item.get("category") or "").lower()
+    locator = item.get("locator") or item.get("location") or ""
+    probe = locator if isinstance(locator, str) else json.dumps(locator, ensure_ascii=False)
+    if facet.startswith("academic_norm") or "未检出" in probe or "not found" in probe.lower():
+        # an absence has no sentence to quote; the locator records where the search ran
+        item["quote_role"] = "absent"
+        return False
+    probe = probe.lower()
+    name_hit = ""
+    for name in sorted(sections, key=len, reverse=True):
+        if len(name) < 4:
+            continue
+        if re.search(r"(^|[^a-z0-9_])%s([^a-z0-9_]|$)" % re.escape(name), probe):
+            name_hit = name
+            break
+    candidates = _sentences(sections.get(name_hit, "")) if name_hit else []
+    anchor = ""
+    if candidates:
+        target = " ".join(str(item.get(k) or "") for k in
+                           ("finding", "issue", "recommendation", "suggested_revision", "rationale"))
+        words = set(re.findall(r"[A-Za-z\u4e00-\u9fff]{3,}", target.lower()))
+        scored = []
+        for index, sentence in enumerate(candidates):
+            shared = len(words & set(re.findall(r"[A-Za-z\u4e00-\u9fff]{3,}", sentence.lower())))
+            scored.append((-shared, (name_hit, index), sentence))
+        for _, key, sentence in sorted(scored):
+            if key not in used:
+                anchor, chosen = sentence, key
+                break
+        if not anchor:
+            anchor, chosen = sorted(scored)[0][2], sorted(scored)[0][1]
+        used.add(chosen)
+    if not anchor:
+        item["quote_role"] = "absent"
+        return False
+    item["quote"] = anchor[:300]
+    item["quote_role"] = "anchor"
+    item["anchor_section"] = name_hit
+    item["anchor_note"] = ("absence-type finding: the quoted sentence is the nearest anchor in the "
+                           "referenced section, not evidence of the defect itself")
+    return True
+
+
+def _context_sentence(material, quote):
+    """Sentence-level context around a short quote so the locator can be followed."""
+    quote = _norm(quote)
+    if not quote or not material:
+        return ""
+    pos = material.find(quote)
+    if pos < 0:
+        return ""
+    start = max(material.rfind(". ", 0, pos), material.rfind("。", 0, pos), material.rfind("! ", 0, pos),
+                material.rfind("? ", 0, pos)) + 1
+    ends = [idx for idx in (material.find(". ", pos), material.find("。", pos), material.find("! ", pos),
+                            material.find("? ", pos)) if idx >= 0]
+    end = (min(ends) + 1) if ends else min(len(material), pos + 240)
+    sentence = _norm(material[start:end])
+    return sentence if len(sentence) >= 20 else ""
+
+
+def _dedupe(issues):
+    """Collapse findings that are identical in facet, quote phrase and revision."""
+    seen, kept = {}, []
+    removed = 0
+    for item in issues:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        key = (str(item.get("facet") or item.get("category") or "").lower(),
+               _norm(item.get("quote") or "")[:160],
+               str(item.get("severity") or "").lower(),
+               _norm(item.get("suggested_revision") or item.get("recommendation") or "")[:120])
+        if key in seen:
+            first = seen[key]
+            merged = list(dict.fromkeys((first.get("citation_ids") or []) + (item.get("citation_ids") or [])))
+            if merged:
+                first["citation_ids"] = merged
+            first["merged_duplicates"] = int(first.get("merged_duplicates") or 0) + 1
+            removed += 1
+            continue
+        seen[key] = item
+        kept.append(item)
+    return kept, removed
+
+
+def _issue_type(item):
+    facet = str(item.get("facet") or item.get("category") or item.get("kind") or "").lower()
+    return TYPE_BY_FACET.get(facet, "suggestion")
+
+
+def _sync_counts(payload, issues):
+    """Keep every published count block equal to the surviving findings after dedupe."""
+    total = len(issues)
+    by_sev = {}
+    for item in issues:
+        if isinstance(item, dict):
+            sev = str(item.get("severity") or "unspecified").lower()
+            by_sev[sev] = by_sev.get(sev, 0) + 1
+
+    def _fix(block):
+        if not isinstance(block, dict):
+            return
+        if isinstance(block.get("findings"), int):
+            block["findings"] = total
+        if isinstance(block.get("by_severity"), dict):
+            block["by_severity"] = dict(sorted(by_sev.items()))
+        if isinstance(block.get("total"), int) and ("by_severity" in block or "facets_covered" in block
+                                                    or "verdict" in block):
+            block["total"] = total
+
+    for key in ("counts", "summary_counts", "summary"):
+        _fix(payload.get(key))
+    _fix(payload)
+    nested = payload.get("result")
+    if isinstance(nested, dict):
+        for key in ("summary", "counts"):
+            _fix(nested.get(key))
+    return by_sev
 
 
 def enrich(payload, case, case_path=None, work_dir=None):
@@ -359,7 +589,32 @@ def enrich(payload, case, case_path=None, work_dir=None):
     issues = _issue_list(payload)
     if not isinstance(payload.get("findings"), list):
         payload["findings"] = issues
+    kept, removed = _dedupe(issues)
+    if isinstance(issues, list):
+        issues[:] = kept
+    if removed:
+        _sync_counts(payload, issues)
     material = _material_text(case if isinstance(case, dict) else {})
+    sections = _section_texts(case if isinstance(case, dict) else {})
+    anchored = 0
+    used_anchors = set()
+    for item in issues:
+        if isinstance(item, dict):
+            item.setdefault("issue_type", _issue_type(item))
+            if item.get("issue_type") in (None, ""):
+                item["issue_type"] = _issue_type(item)
+            if _anchor_empty_quote(item, sections, used_anchors):
+                anchored += 1
+                continue
+            quote = _norm(item.get("quote") or "")
+            if quote and material and len(quote) < 12:
+                context = _context_sentence(material, quote)
+                if context:
+                    item["quote_context"] = context
+                    if CITE_MARK.match(quote):
+                        item["quote_role"] = "citation_marker"
+                        item.setdefault("anchor_note", "citation marker quoted; the surrounding "
+                                                       "sentence is given as context")
     verified = unverified = not_applicable = 0
     for item in issues:
         if not isinstance(item, dict):
@@ -379,18 +634,24 @@ def enrich(payload, case, case_path=None, work_dir=None):
         "verified": verified,
         "unverified": unverified,
         "not_applicable": not_applicable,
+        "anchored_absence_findings": anchored,
         "n_locator_issues": unverified,
         "method": "exact substring match of each finding quote against the actual input text",
     }
     by_sev = {}
+    by_type = {}
     for item in issues:
         if isinstance(item, dict):
             sev = str(item.get("severity") or "unspecified").lower()
             by_sev[sev] = by_sev.get(sev, 0) + 1
+            kind = str(item.get("issue_type") or _issue_type(item))
+            by_type[kind] = by_type.get(kind, 0) + 1
     payload["counts_reconciliation"] = {
         "findings_total": len(issues),
         "by_severity": by_sev,
+        "by_type": by_type,
         "severity_sum": sum(by_sev.values()),
+        "dedup_removed": removed,
         "balanced": sum(by_sev.values()) == len(issues),
     }
     artifacts = [ARTIFACT_JSON, ARTIFACT_CSV, ARTIFACT_MD, ARTIFACT_PROV, ARTIFACT_VALID]
@@ -437,12 +698,15 @@ def _csv_rows(issues):
         rows.append({
             "finding_id": item.get("id") or item.get("finding_id") or "F%02d" % index,
             "facet": item.get("facet") or item.get("category") or item.get("kind") or "",
+            "issue_type": item.get("issue_type") or _issue_type(item),
             "severity": item.get("severity") or "",
             "locator": item.get("locator") or item.get("location") or "",
             "quote": item.get("quote") or "",
+            "quote_role": item.get("quote_role") or "",
+            "quote_context": item.get("quote_context") or "",
             "quote_verified": "" if item.get("quote_verified") is None else str(item.get("quote_verified")).lower(),
             "issue": item.get("issue") or item.get("finding") or item.get("verdict") or "",
-            "evidence": item.get("evidence") or item.get("rationale") or "",
+            "evidence": item.get("evidence") or item.get("rationale") or item.get("anchor_note") or "",
             "recommendation": item.get("recommendation") or item.get("suggested_revision") or "",
         })
     return rows
@@ -496,17 +760,29 @@ def _report_markdown(payload, case_id):
             continue
         lines += ["## %s" % title, ""]
         for index, item in enumerate(group, 1):
-            lines.append("%d. **%s** (%s) — `%s`" % (
+            lines.append("%d. **%s / %s** (%s) — `%s`" % (
                 index, item.get("facet") or item.get("category") or "issue",
+                item.get("issue_type") or _issue_type(item),
                 item.get("severity") or "unspecified",
                 item.get("locator") or item.get("location") or "n/a"))
             if item.get("quote"):
-                lines.append("   - quote: \"%s\"" % item["quote"])
+                suffix = " (anchor)" if item.get("quote_role") == "anchor" else ""
+                lines.append("   - quote%s: \"%s\"" % (suffix, item["quote"]))
+            if item.get("quote_context"):
+                lines.append("   - context: \"%s\"" % item["quote_context"])
             if item.get("issue") or item.get("finding"):
                 lines.append("   - issue: %s" % (item.get("issue") or item.get("finding")))
             if item.get("recommendation") or item.get("suggested_revision"):
                 lines.append("   - revision: %s" % (item.get("recommendation") or item.get("suggested_revision")))
         lines.append("")
+    loc = payload.get("locator_status") or {}
+    if isinstance(loc, dict) and loc.get("quotes_total"):
+        lines += ["## Locator verification", "",
+                  "- quotes checked: %s (verified %s, not applicable %s, unverified %s)" % (
+                      loc.get("quotes_total"), loc.get("verified"), loc.get("not_applicable"),
+                      loc.get("unverified")),
+                  "- anchored absence findings: %s" % loc.get("anchored_absence_findings", 0),
+                  "- method: %s" % loc.get("method"), ""]
     lines += ["## Recommendation", "", "- decision: `%s`" % rec.get("decision"),
               "- rationale: %s" % rec.get("rationale"),
               "- scope: %s" % rec.get("scope"), ""]
@@ -537,8 +813,8 @@ def write_artifacts(payload, out_path, case, case_path=None, work_dir=None):
 
     rows = _csv_rows(_issue_list(payload))
     buffer = io.StringIO()
-    fields = ["finding_id", "facet", "severity", "locator", "quote", "quote_verified",
-              "issue", "evidence", "recommendation"]
+    fields = ["finding_id", "facet", "issue_type", "severity", "locator", "quote", "quote_role",
+              "quote_context", "quote_verified", "issue", "evidence", "recommendation"]
     writer = csv.DictWriter(buffer, fieldnames=fields, lineterminator="\n")
     writer.writeheader()
     for row in rows:
