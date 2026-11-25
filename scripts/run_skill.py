@@ -119,11 +119,15 @@ def sentences(text):
 
 
 def evidence_quote(text, pattern):
+    """Return the full sentence that contains the match (verbatim, never mid-word)."""
     match = re.search(pattern, text, re.IGNORECASE)
     if not match:
         return ""
-    start = max(0, match.start() - 60)
-    return text[start:match.end() + 90]
+    needle = match.group(0).lower()
+    for sentence in sentences(text):
+        if needle and needle in sentence.lower():
+            return sentence[:400]
+    return norm_space(match.group(0))
 
 
 def build_payload(case, task_text):
@@ -145,7 +149,7 @@ def build_payload(case, task_text):
                        "severity_if_absent": severity, "quote": evidence_quote(text, pattern) if present else ""})
         if applicable and not present:
             missing.append({"item": name, "severity": severity, "recommendation": revision})
-            findings.append({"facet": "compliance", "severity": severity, "locator": "text#0", "quote": "",
+            findings.append({"facet": "compliance", "severity": severity, "locator": "full_text#search:no_match", "quote": "",
                              "finding": "Required compliance statement is absent: %s." % name.replace("_", " "),
                              "evidence": "trigger '%s' is active; no matching statement in the text" % trigger,
                              "recommendation": revision, "status": "absent"})
@@ -153,7 +157,12 @@ def build_payload(case, task_text):
     coi_none = re.search(r"no (competing|conflict)|no conflict of interest|无利益冲突", lowered)
     industry = re.search(r"pharma|company|industry|employer|stock|equity|药企|公司|股权", lowered)
     if coi_none and industry:
-        findings.append({"facet": "coi_consistency", "severity": "high", "locator": "text#0",
+        coi_locator = "full_text#search"
+        for index, sentence in enumerate(sentences(text)):
+            if re.search(r"no (competing|conflict)|no conflict of interest|无利益冲突", sentence, re.IGNORECASE):
+                coi_locator = "text#s%d" % index
+                break
+        findings.append({"facet": "coi_consistency", "severity": "high", "locator": coi_locator,
                          "quote": evidence_quote(text, r"no (competing|conflict)"),
                          "finding": "The text declares no conflict of interest while also mentioning industry involvement.",
                          "evidence": "COI-none wording and industry terminology co-occur",
@@ -240,10 +249,16 @@ def build_payload(case, task_text):
             "Detected internal duplicate sentences and listed external checks not performed.",
         ],
     }
+    checks = [{"check": row["item"], "scope": row["trigger"],
+               "status": row["status"],
+               "findings": 1 if row["status"] == "absent" else 0} for row in matrix]
     return {
         "case_id": case_identifier(case),
         "status": status,
         "result": result,
+        "checks": checks,
+        "review_report": {"format": "markdown",
+                          "content": build_review_report(result, case_identifier(case), uncertainty)},
         "evidence": [{"kind": "compliance_item", "item": row["item"], "status": row["status"], "quote": row["quote"]} for row in matrix],
         "uncertainty": uncertainty,
         "errors": [],
@@ -364,6 +379,10 @@ def apply_contract(payload, case):
         if name in payload and payload[name] is not None:
             notes[name] = "produced directly by this run"
             continue
+        if name in flat and flat[name] not in (None, "", [], {}):
+            payload[name] = flat[name]
+            notes[name] = "taken from the run's result section"
+            continue
         value, reason = _derive_named(name, flat)
         if value is not None:
             payload[name] = value
@@ -389,6 +408,53 @@ def write_json(path, payload):
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def build_review_report(result, case_id, uncertainty=None):
+    """Render a complete compliance review report (markdown) from this run."""
+    findings = result.get("findings") or []
+    summary = result.get("summary") or {}
+    counts = summary.get("by_severity") or {}
+    lines = ["# 学术规范与合规审查报告", "",
+             "- case_id: `%s`" % (case_id or "unknown"),
+             "- 判定: %s" % (summary.get("verdict") or "no_verdict"),
+             "- 问题数: %d（high %d / medium %d / low %d）" % (
+                 len(findings), counts.get("high", 0), counts.get("medium", 0), counts.get("low", 0)),
+             "- 适用项: %s / 已具备: %s" % (summary.get("applicable_items", 0), summary.get("present_items", 0)), ""]
+    lines += ["## 一、合规检查矩阵", "", "| 声明项 | 触发条件 | 状态 | 原文依据 |", "|---|---|---|---|"]
+    for row in result.get("compliance_matrix") or []:
+        quote = (row.get("quote") or "").replace("|", "\\|")
+        lines.append("| %s | %s | %s | %s |" % (row.get("item"), row.get("trigger"), row.get("status"),
+                                                ("“%s”" % quote) if quote else "—"))
+    lines += ["", "## 二、问题清单"]
+    if not findings:
+        lines += ["", "本次材料在已检查项上未发现问题；未检查项见第五节。"]
+    for index, item in enumerate(findings, 1):
+        lines += ["", "### F%d [%s] %s" % (index, item.get("severity", "unspecified"), item.get("facet", "finding")), "",
+                  "- 定位：`%s`" % (item.get("locator") or "未定位")]
+        if item.get("quote"):
+            lines.append("- 原文：“%s”" % item["quote"])
+        lines += ["- 判定：%s" % (item.get("finding") or ""),
+                  "- 依据：%s" % (item.get("evidence") or ""),
+                  "- 修改建议：%s" % (item.get("recommendation") or "")]
+    lines += ["", "## 三、修改清单"]
+    for index, item in enumerate(result.get("revision_checklist") or [], 1):
+        lines.append("%d. %s — %s" % (index, item.get("item") or "n/a", item.get("action") or ""))
+    lines += ["", "## 四、限制"]
+    for item in result.get("limitations") or []:
+        lines.append("- %s" % item)
+    lines += ["", "## 五、未执行的检查与待复核"]
+    for item in result.get("unverifiable") or []:
+        lines.append("- %s：%s" % (item.get("item", ""), item.get("reason", "")))
+    for item in (uncertainty or []):
+        if isinstance(item, dict):
+            lines.append("- %s：%s" % (item.get("type", "uncertainty"), item.get("detail", "")))
+        else:
+            lines.append("- %s" % item)
+    lines += ["", "## 六、运行记录"]
+    for item in result.get("change_log") or []:
+        lines.append("- %s" % item)
+    return "\n".join(lines)
 
 
 def main(argv=None):
@@ -421,6 +487,13 @@ def main(argv=None):
     except Exception as exc:
         sys.stderr.write(json.dumps({"status": "failed", "stage": "write_output", "message": str(exc)[:300]}) + "\n")
         return 3
+    report = payload.get("review_report")
+    if isinstance(report, dict) and report.get("content"):
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(args.out)), "review-report.md"), "w", encoding="utf-8") as handle:
+                handle.write(report["content"])
+        except OSError:
+            pass
     sys.stdout.write(json.dumps({"status": payload.get("status"), "case_id": payload.get("case_id"),
                                  "out": str(args.out), "missing": payload.get("stats", {}).get("missing", 0)},
                                 ensure_ascii=False) + "\n")
